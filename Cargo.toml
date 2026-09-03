@@ -1,0 +1,26 @@
+[package]
+name = "norns-xrf-agent"
+version = "1.0.0"
+edition = "2021"
+description = "Reads measurements from an XRF analyser and offers them read-only on the local network."
+license = "MIT"
+repository = "https://github.com/nornsPOS/norns-xrf-agent"
+
+[[bin]]
+name = "norns-xrf-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately few. SQLite is bundled so nothing else has to be installed on
+# the analyser, and the web part is written by hand: a full web framework for
+# two addresses would be weight without value, and every library is one more
+# place that can need a security update.
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
