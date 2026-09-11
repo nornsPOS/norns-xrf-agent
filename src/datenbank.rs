@@ -1,108 +1,65 @@
-//! Reading the analyser's measurement database.
+//! Die Datenbank des Geräts lesen, ohne sie zu stören.
 //!
-//! Read-only throughout: there is no write statement in this file.
+//! SQLite wird ausschliesslich lesend geoeffnet. Der SELECT sieht einen
+//! konsistenten Stand einschliesslich des WAL. Eine Dateikopie allein liess
+//! neue Messungen im WAL zurueck oder kopierte einen halb geschriebenen Stand.
+//! Die kurze Sperrfrist begrenzt das Warten auf die Herstellersoftware.
+//!
+//! Gelesen wird NUR. Der Bote hat keinen einzigen schreibenden Befehl.
 
 use std::path::{Path, PathBuf};
 
 use crate::messung::{elemente_lesen, Messung};
 
-/// The database, located automatically or given explicitly.
+/// Wo die Datenbank des Geräts liegt, gefunden oder gesagt bekommen.
 pub struct Quelle {
     pub datei: PathBuf,
-    abschrift: PathBuf,
 }
 
 impl Quelle {
-    pub fn neu(datei: PathBuf, arbeitsort: &Path) -> Self {
-        Self {
-            datei,
-            abschrift: arbeitsort.join("messungen-abschrift.db"),
-        }
+    pub fn neu(datei: PathBuf, _arbeitsort: &Path) -> Self {
+        Self { datei }
     }
 
-    /// Opens the database read-only.
-    ///
-    /// A read-only connection does not disturb the manufacturer software
-    /// writing to the same file; SQLite is built for a writer and readers to
-    /// coexist. If the file is locked, a copy is read instead. When both
-    /// fail, the error names both reasons.
-    fn oeffnen(&self) -> Result<rusqlite::Connection, String> {
-        let nur_lesen = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI;
-        let pfad = self.datei.to_string_lossy().replace('\\', "/");
-
-        // Direct, read-only.
-        let direkt = rusqlite::Connection::open_with_flags(
-            format!("file:{pfad}?mode=ro"),
-            nur_lesen,
-        );
-        let grund_direkt = match direkt {
-            Ok(v) => return Ok(v),
-            Err(e) => e.to_string(),
-        };
-
-        // Immutable, for the case that SQLite may not write its side files.
-        if let Ok(v) = rusqlite::Connection::open_with_flags(
-            format!("file:{pfad}?mode=ro&immutable=1"),
-            nur_lesen,
-        ) {
-            return Ok(v);
-        }
-
-        // Last resort: read a copy.
-        let grund_abschrift = match std::fs::copy(&self.datei, &self.abschrift) {
-            Ok(_) => {
-                return rusqlite::Connection::open_with_flags(
-                    &self.abschrift,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-                .map_err(|e| format!("Die Abschrift liess sich nicht öffnen: {e}"))
-            }
-            Err(e) => e.to_string(),
-        };
-
-        Err(format!(
-            "Die Datenbank des Geräts liess sich nicht lesen. Direkt: {grund_direkt}. \
-Als Abschrift: {grund_abschrift}."
-        ))
-    }
-
-    /// Size and modification time. A change means the analyser has measured.
-    pub fn stand(&self) -> Option<(u64, i64)> {
-        let m = std::fs::metadata(&self.datei).ok()?;
-        let zeit = m
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        Some((m.len(), zeit))
-    }
-
-    /// Every measurement after `seit_id`, most recent last.
+    /// Alle Messungen NACH `seit_id`, jüngste zuletzt.
     pub fn messungen_seit(&self, seit_id: i64, hoechstens: usize) -> Result<Vec<Messung>, String> {
-        let verbindung = self.oeffnen()?;
+        let verbindung = rusqlite::Connection::open_with_flags(
+            &self.datei,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| format!("Die Geraetedaten liessen sich nicht lesend oeffnen: {e}"))?;
+        verbindung
+            .busy_timeout(std::time::Duration::from_millis(250))
+            .map_err(|e| format!("Die Lesefrist liess sich nicht setzen: {e}"))?;
+
+        // Erster Anschluss: neueste Ergebnisse, kein jahrzehntealter Anfang.
+        // Danach nach Kennung weiterlesen, begrenzt und ohne Luecken im Stapel.
+        let abfrage = if seit_id < 0 {
+            "SELECT KeyId, AppName, SampleName, MeasureTime, InfoSaveFile, ResultContent FROM summarys WHERE KeyId > ?1 ORDER BY KeyId DESC LIMIT ?2"
+        } else {
+            "SELECT KeyId, AppName, SampleName, MeasureTime, InfoSaveFile, ResultContent FROM summarys WHERE KeyId > ?1 ORDER BY KeyId LIMIT ?2"
+        };
 
         let mut satz = verbindung
-            .prepare(
-                "SELECT KeyId, AppName, SampleName, MeasureTime, InfoSaveFile, ResultContent
-                   FROM summarys
-                  WHERE KeyId > ?1
-                  ORDER BY KeyId
-                  LIMIT ?2",
-            )
+            .prepare(abfrage)
             .map_err(|e| format!("Die Tafel `summarys` fehlt: {e}"))?;
 
         let zeilen = satz
             .query_map(rusqlite::params![seit_id, hoechstens as i64], |z| {
-                let inhalt: String = z.get(5).unwrap_or_default();
+                let inhalt: String = z.get(5)?;
                 Ok(Messung {
                     id: z.get(0)?,
                     anwendung: z.get::<_, String>(1).unwrap_or_default(),
                     probe: z.get::<_, String>(2).unwrap_or_default(),
-                    gemessen_am: z.get::<_, i64>(3).unwrap_or(0),
+                    gemessen_am: z.get::<_, i64>(3)?,
                     datei: z.get::<_, String>(4).unwrap_or_default(),
-                    elemente: elemente_lesen(&inhalt),
+                    elemente: elemente_lesen(&inhalt).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e).into(),
+                        )
+                    })?,
                 })
             })
             .map_err(|e| format!("Die Messungen liessen sich nicht lesen: {e}"))?;
@@ -111,13 +68,19 @@ Als Abschrift: {grund_abschrift}."
         for z in zeilen {
             match z {
                 Ok(m) => aus.push(m),
-                // One broken row does not discard the rest.
-                Err(_) => continue,
+                // Kein stiller Rueckfall auf eine aeltere gueltige Messung.
+                Err(e) => {
+                    return Err(format!(
+                        "Eine Geraetemessung ist noch unvollstaendig oder unlesbar: {e}"
+                    ))
+                }
             }
+        }
+        if seit_id < 0 {
+            aus.reverse();
         }
         Ok(aus)
     }
-
 }
 
 /// Locates the database by asking the machine rather than searching it.
@@ -126,7 +89,7 @@ Als Abschrift: {grund_abschrift}."
 /// engine. Its executable path leads to the installation, and the database
 /// sits a few folders above it. If that software is not running, a short
 /// list of known locations is checked.
-pub fn finden() -> Option<PathBuf> {
+pub fn suchen() -> Option<PathBuf> {
     ueber_den_horcher().or_else(ueber_die_ueblichen_stellen)
 }
 
@@ -158,7 +121,10 @@ fn ueber_den_horcher() -> Option<PathBuf> {
 
     // Fallback for Windows versions without Get-NetTCPConnection. Matched on
     // the address only, never on a localised state word.
-    let netz = Command::new("netstat").args(["-ano", "-p", "TCP"]).output().ok()?;
+    let netz = Command::new("netstat")
+        .args(["-ano", "-p", "TCP"])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&netz.stdout);
     let kennung: u32 = text
         .lines()
@@ -235,4 +201,80 @@ fn ueber_die_ueblichen_stellen() -> Option<PathBuf> {
         }
     }
     kandidaten.into_iter().find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Probe {
+        ort: PathBuf,
+        db: Option<rusqlite::Connection>,
+        quelle: Quelle,
+    }
+    impl Probe {
+        fn neu(wal: bool) -> Self {
+            let mut zufall = [0u8; 8];
+            getrandom::getrandom(&mut zufall).unwrap();
+            let ort =
+                std::env::temp_dir().join(format!("norns-xrf-{}", u64::from_ne_bytes(zufall)));
+            std::fs::create_dir(&ort).unwrap();
+            let datei = ort.join("samplesummary.db");
+            let db = rusqlite::Connection::open(&datei).unwrap();
+            db.execute_batch("CREATE TABLE summarys (KeyId INTEGER PRIMARY KEY, AppName TEXT, SampleName TEXT, MeasureTime INTEGER, InfoSaveFile TEXT, ResultContent TEXT);").unwrap();
+            if wal {
+                db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                    .unwrap();
+            }
+            let quelle = Quelle::neu(datei, &ort);
+            Self {
+                ort,
+                db: Some(db),
+                quelle,
+            }
+        }
+        fn einfuegen(&self, id: i64) {
+            self.db
+                .as_ref()
+                .unwrap()
+                .execute(
+                    "INSERT INTO summarys VALUES (?1, 'Metall', 'Probe', 1780000000, '', '<Result><Compo Name=\"Au\" Fractal=\"58.5\" /></Result>')",
+                    [id],
+                )
+                .unwrap();
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            drop(self.db.take());
+            let _ = std::fs::remove_dir_all(&self.ort);
+        }
+    }
+
+    #[test]
+    fn der_ersteintritt_sieht_die_neuesten_statt_der_aeltesten_zweihundert() {
+        let p = Probe::neu(false);
+        p.db.as_ref().unwrap().execute_batch("BEGIN").unwrap();
+        for id in 1..=501 {
+            p.einfuegen(id);
+        }
+        p.db.as_ref().unwrap().execute_batch("COMMIT").unwrap();
+        let neu = p.quelle.messungen_seit(-1, 200).unwrap();
+        assert_eq!(neu.len(), 200);
+        assert_eq!(neu.first().unwrap().id, 302);
+        assert_eq!(neu.last().unwrap().id, 501);
+        p.einfuegen(502);
+        let danach = p.quelle.messungen_seit(501, 200).unwrap();
+        assert_eq!(danach.len(), 1);
+        assert_eq!(danach[0].id, 502);
+    }
+
+    #[test]
+    fn ein_commit_im_wal_wird_erkannt_und_gelesen_ohne_checkpoint() {
+        let p = Probe::neu(true);
+        p.einfuegen(1);
+        let neu = p.quelle.messungen_seit(-1, 200).unwrap();
+        assert_eq!(neu.len(), 1);
+        assert_eq!(neu[0].id, 1);
+    }
 }

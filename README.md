@@ -1,76 +1,95 @@
 # Norns XRF Agent
 
-Reads finished measurements from an XRF analyser and offers them, read-only,
-on the local network.
+Reads finished analyser measurements from the manufacturer's SQLite database.
+It never starts a measurement or writes to that database.
 
-## Install
+This source is maintained in Norns POS at `apps/pruefgeraet-bote` and mirrored
+without changes to the standalone `norns-xrf-agent` repository. Both builds
+use the same Cargo files, sources and process tests.
 
-Copy the executable onto the analyser's PC and open it. Windows asks for
-administrator rights; confirm the dialog. The result is shown in a window.
+## Installation on Windows
 
-The agent locates the measurement database, registers a scheduled task that
-starts with the machine and runs as SYSTEM, adds a firewall rule limited to
-the local subnet, and starts serving.
+Open `norns-xrf-agent.exe` on the analyser PC and approve the Windows elevation
+prompt. The installer locates the source through the analyser process on TCP
+9612. If it cannot find the source, run:
 
-| Command | Effect |
-|---|---|
-| *(no argument)* | Install and start |
-| `--probe [path]` | Print the five most recent measurements and exit |
-| `--jetzt [path]` | Run in the foreground |
-| `--entfernen` | Remove the task and the firewall rule |
-
-If the database is not found automatically, pass its path:
-
-```
-norns-xrf-agent.exe "D:\XRFSeries\XRF-A7\Data\User\samplesummary.db"
+```text
+norns-xrf-agent.exe --einrichten "D:\XRFSeries\XRF-A7\Data\User\samplesummary.db"
 ```
 
-## Interface
+A scheduled task runs as SYSTEM at startup, without a login, with restart on
+failure and no three-day execution limit. Program and connection code are kept
+in `%ProgramData%\Norns\XrfAgent`, restricted to administrators and SYSTEM.
+The firewall rule permits TCP 9614 from the local subnet only. A successful
+installation requires an authenticated, healthy response from the new process.
 
-TCP 9614, JSON.
+The window displays a connection code. Enter it once in Norns device settings.
+The code persists across restarts. Older agents without this protocol need to
+be updated together with the register; no unauthenticated fallback is used.
+The shared code authenticates access over HTTP; transport encryption and
+server identity verification are not provided by this protocol. Use only a
+trusted shop network. Do not expose the port to the internet.
 
-| Address | Answer |
-|---|---|
-| `GET /` | Version, database path, last measurement, count |
-| `GET /messungen?seit=<id>` | All measurements with an id greater than `<id>` |
+Commands: `--jetzt [path]` runs in the foreground, `--probe [path]` reads once,
+`--entfernen` removes the task and firewall rule. `--einrichten-still` is for
+an already elevated deployment/test process; it does not display the code.
 
-A measurement carries the application used, the sample name, the time, every
-element found with its share in per mille, and the derived gold content and
-karat. Elements reported as zero are omitted; trace elements from gemstone
-applications are kept.
+## Result contract (protocol 2)
+
+`GET /messungen?seit=-1`, header `X-Norns-Bote: <connection code>`.
+`/stand` and `/` use the same authenticated envelope.
 
 ```json
 {
-  "id": 2150,
-  "anwendung": "AuAgX",
-  "probe": "TempSpektr",
-  "gemessenAm": 1788457620,
-  "elemente": [{ "symbol": "Au", "promille": 999.9 }],
-  "goldPromille": 999.9,
-  "karat": 24.0
+  "protokoll": 2,
+  "quelleOk": true,
+  "alterMs": 100,
+  "sitzung": "<64 hexadecimal characters, new for each process>",
+  "revision": 1,
+  "fehler": null,
+  "messungen": [{
+    "id": 502,
+    "anwendung": "AuAgX",
+    "probe": "Ring",
+    "gemessenAm": 1780000000,
+    "elemente": [{"symbol": "Au", "promille": 585.0}],
+    "goldPromille": 585.0,
+    "karat": 14.0
+  }]
 }
 ```
 
-## Safety
+The newest 200 rows are refreshed every 700 ms using a read-only SQLite
+connection, including WAL commits. Each refresh replaces the snapshot, so
+updates to an existing ID, cleared databases and restarted numbering are seen.
+`seit` filters that bounded snapshot; it is not a lossless historical export.
+Use `seit=-1` for the current snapshot, including in-place corrections.
 
-The analyser contains an X-ray tube. The agent is built so that it cannot act
-on the device:
+`alterMs` is monotonic time since the last successful source read. Source
+failure, incomplete measurements or more than five seconds without a
+successful read yield HTTP 503, `quelleOk:false` and an empty measurement list.
+401 rejects a missing/wrong code. Results are never silently replaced with old
+cached values. The register must still validate measurement time and require
+explicit acceptance for the current item.
 
-* Read-only. No write statement, no address that changes anything, and no
-  address that starts a measurement.
-* Local subnet only. No outbound connections.
-* The measurement is read through a read-only connection; if the file is
-  locked, a copy is read instead.
+The HTTP server caps concurrent connections at eight, headers at 8 KiB and
+socket read/write waiting at two seconds. Only GET routes are supported.
 
-## Build
+## Verification
 
+```text
+cargo test --locked
+cargo clippy --all-targets -- -D warnings
 ```
-cargo build --release --target x86_64-pc-windows-msvc
-```
 
-Rust toolchain only. SQLite is compiled in; nothing has to be installed
-beside the executable.
+Process tests create synthetic SQLite/WAL data, start the actual executable,
+query HTTP, correct the same ID, break/recover the source and reset numbering.
+They terminate their processes and remove their fixtures.
 
-## Licence
+`scripts/windows-probe.ps1 -Programm <exe>` additionally installs and restarts
+the actual task on a disposable Windows runner. Never run it against a merchant
+installation. CI captures this separately from physical analyser acceptance.
 
-MIT.
+For isolated testing, `NORNS_XRF_HOME` and `NORNS_XRF_LISTEN` override the data
+folder and listening address. They are foreground/test overrides; the installed
+Windows task uses the durable system defaults.

@@ -1,22 +1,25 @@
 [package]
 name = "norns-xrf-agent"
-version = "1.0.0"
+version = "1.4.0"
 edition = "2021"
-description = "Reads measurements from an XRF analyser and offers them read-only on the local network."
-license = "MIT"
-repository = "https://github.com/nornsPOS/norns-xrf-agent"
+description = "Der Bote: traegt die Messungen des Pruefgeraets zur Kasse."
 
 [[bin]]
 name = "norns-xrf-agent"
 path = "src/main.rs"
 
 [dependencies]
-# Deliberately few. SQLite is bundled so nothing else has to be installed on
-# the analyser, and the web part is written by hand: a full web framework for
-# two addresses would be weight without value, and every library is one more
-# place that can need a security update.
+# Bewusst wenig: SQLite mitgeliefert (kein zweites Stueck auf dem Geraet),
+# und JSON. Der Webdienst ist von Hand geschrieben, weil eine ganze
+# Web-Bibliothek fuer drei Adressen zu viel Gewicht auf einem Geraet ist,
+# das messen soll und nicht bedienen.
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
+roxmltree = "0.20"
+# ⛔ B23: das Botenwort braucht Zufall vom Betriebssystem, nicht aus der Uhr.
+# Eine Kiste ohne eigene Abhaengigkeiten, also kein Gewicht im Sinne oben.
+getrandom = "0.2"
+
 
 [profile.release]
 opt-level = "z"
