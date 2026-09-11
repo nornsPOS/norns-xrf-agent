@@ -22,6 +22,8 @@ impl Quelle {
     }
 
     /// Alle Messungen NACH `seit_id`, jüngste zuletzt.
+    /// Bei negativem `seit_id` nur den zusammenhaengenden gueltigen neuesten
+    /// Stapel lesen; ein defektes aelteres Ergebnis bildet dessen Grenze.
     pub fn messungen_seit(&self, seit_id: i64, hoechstens: usize) -> Result<Vec<Messung>, String> {
         let verbindung = rusqlite::Connection::open_with_flags(
             &self.datei,
@@ -68,6 +70,15 @@ impl Quelle {
         for z in zeilen {
             match z {
                 Ok(m) => aus.push(m),
+                // Alte abgebrochene Messungen duerfen eine neuere vollstaendige
+                // Messung nicht sperren. Nur der Ergebnisinhalt darf diese
+                // Grenze bilden, nie ein Datenbank- oder Abfragefehler.
+                Err(
+                    rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, _)
+                    | rusqlite::Error::InvalidColumnType(5, _, _),
+                ) if seit_id < 0 && !aus.is_empty() => {
+                    break;
+                }
                 // Kein stiller Rueckfall auf eine aeltere gueltige Messung.
                 Err(e) => {
                     return Err(format!(
@@ -267,6 +278,63 @@ mod tests {
         let danach = p.quelle.messungen_seit(501, 200).unwrap();
         assert_eq!(danach.len(), 1);
         assert_eq!(danach[0].id, 502);
+    }
+
+    #[test]
+    fn alte_unvollstaendige_ergebnisse_begrenzen_nur_den_neuesten_gueltigen_stapel() {
+        let p = Probe::neu(true);
+        for id in 1..=5 {
+            p.einfuegen(id);
+        }
+        for defekt in ["''", "'<Result />'", "NULL", "X'00'"] {
+            p.db.as_ref()
+                .unwrap()
+                .execute_batch(&format!(
+                    "UPDATE summarys SET ResultContent = {defekt} WHERE KeyId = 3"
+                ))
+                .unwrap();
+            let neu = p.quelle.messungen_seit(-1, 200).unwrap();
+            assert_eq!(neu.iter().map(|m| m.id).collect::<Vec<_>>(), [4, 5]);
+            // Inkrementelles Lesen darf eine Luecke nicht als Erfolg melden.
+            assert!(p.quelle.messungen_seit(1, 200).is_err());
+        }
+        p.db.as_ref()
+            .unwrap()
+            .execute_batch("DELETE FROM summarys WHERE KeyId = 3")
+            .unwrap();
+        p.einfuegen(3);
+        let repariert = p.quelle.messungen_seit(-1, 200).unwrap();
+        assert_eq!(
+            repariert.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn neuester_defekt_und_fehler_ausserhalb_des_ergebnisinhalts_bleiben_fehler() {
+        let p = Probe::neu(false);
+        p.einfuegen(1);
+        p.einfuegen(2);
+        p.db.as_ref()
+            .unwrap()
+            .execute_batch("UPDATE summarys SET ResultContent = '' WHERE KeyId = 2")
+            .unwrap();
+        assert!(p.quelle.messungen_seit(-1, 200).is_err());
+        p.db.as_ref()
+            .unwrap()
+            .execute_batch("DELETE FROM summarys WHERE KeyId = 2")
+            .unwrap();
+        p.einfuegen(2);
+        p.db.as_ref()
+            .unwrap()
+            .execute_batch("UPDATE summarys SET MeasureTime = 'ungueltig' WHERE KeyId = 1")
+            .unwrap();
+        assert!(p.quelle.messungen_seit(-1, 200).is_err());
+        p.db.as_ref()
+            .unwrap()
+            .execute_batch("ALTER TABLE summarys RENAME TO andere_tafel")
+            .unwrap();
+        assert!(p.quelle.messungen_seit(-1, 200).is_err());
     }
 
     #[test]

@@ -60,13 +60,16 @@ an already elevated deployment/test process; it does not display the code.
 ```
 
 The newest 200 rows are refreshed every 700 ms using a read-only SQLite
-connection, including WAL commits. Each refresh replaces the snapshot, so
+connection, including WAL commits. Only the contiguous valid newest batch is
+returned: an older unreadable result ends that batch, so an abandoned historical
+measurement cannot block newer valid results. The newest unreadable result
+still fails closed; the reader never falls back to an older valid measurement. Each refresh replaces the snapshot, so
 updates to an existing ID, cleared databases and restarted numbering are seen.
 `seit` filters that bounded snapshot; it is not a lossless historical export.
 Use `seit=-1` for the current snapshot, including in-place corrections.
 
 `alterMs` is monotonic time since the last successful source read. Source
-failure, incomplete measurements or more than five seconds without a
+failure, an incomplete newest measurement or more than five seconds without a
 successful read yield HTTP 503, `quelleOk:false` and an empty measurement list.
 401 rejects a missing/wrong code. Results are never silently replaced with old
 cached values. The register must still validate measurement time and require

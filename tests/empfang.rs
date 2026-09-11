@@ -137,6 +137,35 @@ fn neue_wal_werte_korrekturen_und_quellfehler_erreichen_http() {
 }
 
 #[test]
+fn historischer_defekt_blockiert_keine_neue_messung_und_reparaturen_kommen_an() {
+    let p = Probe::neu();
+    p.einfuegen(1, "58.5");
+    p.db.execute(
+        "INSERT INTO summarys VALUES (2,'AuAgX','alt',1780000000,'','<Result />')",
+        [],
+    )
+    .unwrap();
+    p.einfuegen(3, "75");
+    p.einfuegen(4, "99.9");
+    let a = p.warten(|(s, v)| *s == 200 && v["messungen"].as_array().is_some_and(|m| m.len() == 2));
+    assert_eq!(a.1["quelleOk"], true);
+    assert_eq!(a.1["messungen"][0]["id"], 3);
+    assert_eq!(a.1["messungen"][1]["id"], 4);
+    assert_eq!(a.1["messungen"][1]["goldPromille"], 999.0);
+    p.einfuegen(2, "80");
+    let a = p.warten(|(s, v)| *s == 200 && v["messungen"].as_array().is_some_and(|m| m.len() == 4));
+    assert_eq!(a.1["messungen"][1]["id"], 2);
+    assert_eq!(a.1["messungen"][1]["goldPromille"], 800.0);
+    p.db.execute("UPDATE summarys SET ResultContent = '' WHERE KeyId = 4", [])
+        .unwrap();
+    let a = p.warten(|(s, _)| *s == 503);
+    assert_eq!(a.1["quelleOk"], false);
+    assert!(a.1["messungen"].as_array().unwrap().is_empty());
+    p.einfuegen(4, "91.6");
+    p.warten(|(s, v)| *s == 200 && v["messungen"][3]["goldPromille"] == 916.0);
+}
+
+#[test]
 fn unvollstaendige_neueste_messung_ist_keine_alte_erfolgsmeldung() {
     let p = Probe::neu();
     p.einfuegen(1, "58.5");
