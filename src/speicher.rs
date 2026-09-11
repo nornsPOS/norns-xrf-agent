@@ -10,9 +10,9 @@ pub fn ort() -> Result<PathBuf, String> {
     }
     #[cfg(windows)]
     {
-        return std::env::var_os("ProgramData")
+        std::env::var_os("ProgramData")
             .map(|p| PathBuf::from(p).join("Norns").join("XrfAgent"))
-            .ok_or_else(|| "Windows nennt keine gemeinsame Programmablage.".into());
+            .ok_or_else(|| "Windows nennt keine gemeinsame Programmablage.".into())
     }
     #[cfg(not(windows))]
     {
