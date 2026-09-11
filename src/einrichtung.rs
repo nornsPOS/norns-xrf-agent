@@ -130,11 +130,17 @@ pub fn installieren(pfad: Option<PathBuf>, bereits_erhoeht: bool) -> Result<(), 
         .map_err(|e| e.to_string())?;
     let aufgabe = ort.join("aufgabe.xml");
     let text = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers><Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings><Actions Context="System"><Exec><Command>{}</Command><Arguments>--jetzt &quot;{}&quot;</Arguments></Exec></Actions></Task>"#,
+        r#"<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers><Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings><Actions Context="System"><Exec><Command>{}</Command><Arguments>--jetzt &quot;{}&quot;</Arguments></Exec></Actions></Task>"#,
         xml(&ziel.to_string_lossy()),
         xml(&quelle.to_string_lossy())
     );
-    std::fs::write(&aufgabe, text).map_err(|e| e.to_string())?;
+    // schtasks liest Aufgaben-XML als UTF-16; Deklaration und Bytes muessen
+    // uebereinstimmen, auch wenn der Datenbankpfad Umlaute enthaelt.
+    let bytes: Vec<u8> = std::iter::once(0xfeff_u16)
+        .chain(text.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    std::fs::write(&aufgabe, bytes).map_err(|e| e.to_string())?;
     ausfuehren(
         "schtasks",
         &[
